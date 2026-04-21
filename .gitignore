@@ -1,0 +1,6 @@
+/jira
+/dist/
+*.db
+*.db-wal
+*.db-shm
+coverage.out
