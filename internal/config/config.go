@@ -1,9 +1,8 @@
-// Package config loads the jira-tui TOML configuration file and resolves
+// Package config loads the jui TOML configuration file and resolves
 // runtime paths.
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +12,22 @@ import (
 
 	"github.com/BurntSushi/toml"
 )
+
+// defaultConfigBody is written on first run when no config file exists.
+const defaultConfigBody = `# jui configuration
+
+site = ""                      # e.g. "acme.atlassian.net"
+email = ""                     # your Atlassian account email
+# Create a token at https://id.atlassian.com/manage-profile/security/api-tokens
+# You can also set the JIRA_API_TOKEN environment variable instead.
+api_token = ""
+jql = "assignee = currentUser() AND resolution = Unresolved"
+sync_interval = "5m"
+initial_lookback = "90d"
+
+[ui]
+theme = "dark"
+`
 
 // Config is the effective runtime configuration.
 type Config struct {
@@ -49,14 +64,38 @@ type rawConfig struct {
 	} `toml:"ui"`
 }
 
-// DefaultPath returns the expected config path under $HOME on macOS.
+// DefaultPath returns the expected config path under $HOME.
 func DefaultPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Library", "Application Support", "jira-tui", "config.toml")
+	return filepath.Join(home, ".config", "jui", "jui.toml")
 }
 
-// Load reads the config from DefaultPath.
-func Load() (*Config, error) { return LoadFrom(DefaultPath()) }
+// EnsureDefault creates the parent directory and writes a default config file
+// at path if one does not already exist. A nil error with created=false means
+// the file was already there.
+func EnsureDefault(path string) (created bool, err error) {
+	if _, statErr := os.Stat(path); statErr == nil {
+		return false, nil
+	} else if !os.IsNotExist(statErr) {
+		return false, fmt.Errorf("stat %s: %w", path, statErr)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(defaultConfigBody), 0o600); err != nil {
+		return false, fmt.Errorf("write %s: %w", path, err)
+	}
+	return true, nil
+}
+
+// Load reads the config from DefaultPath, creating a default file on first run.
+func Load() (*Config, error) {
+	path := DefaultPath()
+	if _, err := EnsureDefault(path); err != nil {
+		return nil, err
+	}
+	return LoadFrom(path)
+}
 
 // LoadFrom reads a config from the given path.
 func LoadFrom(path string) (*Config, error) {
@@ -68,11 +107,24 @@ func LoadFrom(path string) (*Config, error) {
 }
 
 func build(raw *rawConfig, path string) (*Config, error) {
+	// Resolve token: env > config.
+	token := os.Getenv("JIRA_API_TOKEN")
+	if token == "" {
+		token = raw.APIToken
+	}
+
+	var missing []string
 	if raw.Site == "" {
-		return nil, errors.New("config: site is required")
+		missing = append(missing, "site")
 	}
 	if raw.Email == "" {
-		return nil, errors.New("config: email is required")
+		missing = append(missing, "email")
+	}
+	if token == "" {
+		missing = append(missing, "api_token")
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("config: missing required field(s): %s — edit %s (or set JIRA_API_TOKEN for the token)", strings.Join(missing, ", "), path)
 	}
 
 	interval := 5 * time.Minute
@@ -91,12 +143,6 @@ func build(raw *rawConfig, path string) (*Config, error) {
 			return nil, fmt.Errorf("config: initial_lookback: %w", err)
 		}
 		lookback = d
-	}
-
-	// Resolve token: env > config > (keychain — not yet implemented).
-	token := os.Getenv("JIRA_API_TOKEN")
-	if token == "" {
-		token = raw.APIToken
 	}
 
 	cfgDir := filepath.Dir(path)

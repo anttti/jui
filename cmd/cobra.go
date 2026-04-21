@@ -31,7 +31,7 @@ func NewRootCmd(stdout, stderr io.Writer) *cobra.Command {
 			return TUI(signalCtx(), cfg)
 		},
 	}
-	root.PersistentFlags().StringVar(&configPath, "config", "", "path to config.toml (default: ~/Library/Application Support/jira-tui/config.toml)")
+	root.PersistentFlags().StringVar(&configPath, "config", "", "path to jui.toml (default: ~/.config/jui/jui.toml)")
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 
@@ -108,6 +108,13 @@ func NewRootCmd(stdout, stderr io.Writer) *cobra.Command {
 func loadConfig(path string) (*config.Config, error) {
 	if path == "" {
 		path = config.DefaultPath()
+		created, err := config.EnsureDefault(path)
+		if err != nil {
+			return nil, fmt.Errorf("config: %w", err)
+		}
+		if created {
+			return nil, fmt.Errorf("config: wrote default config to %s — edit it (set site, email, api_token) and rerun", path)
+		}
 	}
 	cfg, err := config.LoadFrom(path)
 	if err != nil {
