@@ -7,12 +7,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/user"
+	"path/filepath"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/anttti/j/internal/config"
 	"github.com/anttti/j/internal/jira"
+	"github.com/anttti/j/internal/launchd"
 	"github.com/anttti/j/internal/model"
 	"github.com/anttti/j/internal/platform"
 	"github.com/anttti/j/internal/store/sqlitestore"
@@ -135,4 +139,52 @@ func Doctor(ctx context.Context, cfg *config.Config, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "jira:    ok (authenticated as %s, %s)\n", u.DisplayName, u.Email)
 	return nil
+}
+
+// AgentInstall writes the launchd plist and bootstraps the daemon.
+func AgentInstall(cfg *config.Config, stdout io.Writer) error {
+	a, err := newAgent(cfg)
+	if err != nil {
+		return err
+	}
+	if err := a.Install(); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "installed: %s\n", agentPlistPath())
+	return nil
+}
+
+// AgentUninstall removes the plist and boots the daemon out of launchd.
+func AgentUninstall(cfg *config.Config, stdout io.Writer) error {
+	a, err := newAgent(cfg)
+	if err != nil {
+		return err
+	}
+	if err := a.Uninstall(); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "uninstalled: %s\n", agentPlistPath())
+	return nil
+}
+
+func newAgent(cfg *config.Config) (*launchd.Agent, error) {
+	bin, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve binary path: %w", err)
+	}
+	u, err := user.Current()
+	if err != nil {
+		return nil, err
+	}
+	return launchd.NewAgent(launchd.AgentConfig{
+		PlistPath:  agentPlistPath(),
+		BinaryPath: bin,
+		LogDir:     cfg.LogDir,
+		Domain:     "gui/" + u.Uid,
+	}), nil
+}
+
+func agentPlistPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library", "LaunchAgents", launchd.DefaultLabel+".plist")
 }

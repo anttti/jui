@@ -75,7 +75,33 @@ func NewRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		},
 	}
 
-	root.AddCommand(syncCmd, daemonCmd, doctorCmd)
+	agentCmd := &cobra.Command{Use: "agent", Short: "Manage the launchd LaunchAgent"}
+	agentCmd.AddCommand(
+		&cobra.Command{
+			Use:   "install",
+			Short: "Install the launchd LaunchAgent",
+			RunE: func(c *cobra.Command, _ []string) error {
+				cfg, err := loadConfig(configPath)
+				if err != nil {
+					return err
+				}
+				return AgentInstall(cfg, stdout)
+			},
+		},
+		&cobra.Command{
+			Use:   "uninstall",
+			Short: "Remove the launchd LaunchAgent",
+			RunE: func(c *cobra.Command, _ []string) error {
+				cfg, err := loadConfig(configPath)
+				if err != nil {
+					return err
+				}
+				return AgentUninstall(cfg, stdout)
+			},
+		},
+	)
+
+	root.AddCommand(syncCmd, daemonCmd, doctorCmd, agentCmd)
 	return root
 }
 
