@@ -1,5 +1,6 @@
--- Schema v1.
-CREATE TABLE issues (
+-- Schema v1. All statements are idempotent so re-running on an existing
+-- DB is a no-op.
+CREATE TABLE IF NOT EXISTS issues (
   key                 TEXT PRIMARY KEY,
   id                  TEXT NOT NULL,
   project_key         TEXT NOT NULL,
@@ -23,12 +24,12 @@ CREATE TABLE issues (
   raw_json            BLOB NOT NULL
 );
 
-CREATE INDEX idx_issues_updated  ON issues(updated DESC);
-CREATE INDEX idx_issues_status   ON issues(status);
-CREATE INDEX idx_issues_type     ON issues(issue_type);
-CREATE INDEX idx_issues_assignee ON issues(assignee_account_id);
+CREATE INDEX IF NOT EXISTS idx_issues_updated  ON issues(updated DESC);
+CREATE INDEX IF NOT EXISTS idx_issues_status   ON issues(status);
+CREATE INDEX IF NOT EXISTS idx_issues_type     ON issues(issue_type);
+CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee_account_id);
 
-CREATE TABLE comments (
+CREATE TABLE IF NOT EXISTS comments (
   id                TEXT PRIMARY KEY,
   issue_key         TEXT NOT NULL,
   author_name       TEXT,
@@ -38,9 +39,9 @@ CREATE TABLE comments (
   created           TEXT NOT NULL,
   updated           TEXT NOT NULL
 );
-CREATE INDEX idx_comments_issue ON comments(issue_key, created);
+CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_key, created);
 
-CREATE VIRTUAL TABLE issues_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
   summary,
   description,
   content='issues',
@@ -48,27 +49,27 @@ CREATE VIRTUAL TABLE issues_fts USING fts5(
   tokenize = 'unicode61'
 );
 
-CREATE TRIGGER issues_ai AFTER INSERT ON issues BEGIN
+CREATE TRIGGER IF NOT EXISTS issues_ai AFTER INSERT ON issues BEGIN
   INSERT INTO issues_fts(rowid, summary, description)
   VALUES (new.rowid, new.summary, new.description);
 END;
 
-CREATE TRIGGER issues_ad AFTER DELETE ON issues BEGIN
+CREATE TRIGGER IF NOT EXISTS issues_ad AFTER DELETE ON issues BEGIN
   INSERT INTO issues_fts(issues_fts, rowid, summary, description)
   VALUES ('delete', old.rowid, old.summary, old.description);
 END;
 
-CREATE TRIGGER issues_au AFTER UPDATE ON issues BEGIN
+CREATE TRIGGER IF NOT EXISTS issues_au AFTER UPDATE ON issues BEGIN
   INSERT INTO issues_fts(issues_fts, rowid, summary, description)
   VALUES ('delete', old.rowid, old.summary, old.description);
   INSERT INTO issues_fts(rowid, summary, description)
   VALUES (new.rowid, new.summary, new.description);
 END;
 
-CREATE TABLE sync_state (
+CREATE TABLE IF NOT EXISTS sync_state (
   id              INTEGER PRIMARY KEY CHECK (id = 1),
   last_sync_utc   TEXT,
   last_full_sync  TEXT,
   last_error      TEXT NOT NULL DEFAULT ''
 );
-INSERT INTO sync_state(id) VALUES (1);
+INSERT OR IGNORE INTO sync_state(id) VALUES (1);

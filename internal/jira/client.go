@@ -226,8 +226,9 @@ func (c *Client) get(ctx context.Context, path string, q url.Values) ([]byte, er
 
 		resp, err := c.http.Do(req)
 		if err != nil {
-			lastErr = err
-			continue
+			// Transport errors (refused, DNS, context cancel) aren't
+			// transient in a useful way — fail fast.
+			return nil, err
 		}
 		body, rerr := io.ReadAll(resp.Body)
 		resp.Body.Close()
