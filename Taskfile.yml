@@ -1,0 +1,49 @@
+version: '3'
+
+vars:
+  BINARY: jira
+  PKG: ./...
+
+tasks:
+  default:
+    desc: Build the app
+    cmds:
+      - task: build
+
+  build:
+    desc: Build the jira binary into the repo root
+    cmds:
+      - go build -o {{.BINARY}} .
+    sources:
+      - '**/*.go'
+      - go.mod
+      - go.sum
+    generates:
+      - '{{.BINARY}}'
+
+  run:
+    desc: Build and run the app
+    deps: [build]
+    cmds:
+      - ./{{.BINARY}} {{.CLI_ARGS}}
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test {{.PKG}}
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet {{.PKG}}
+
+  tidy:
+    desc: Tidy go.mod / go.sum
+    cmds:
+      - go mod tidy
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -f {{.BINARY}}
+      - rm -rf dist
