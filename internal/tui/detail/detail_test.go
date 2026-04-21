@@ -2,6 +2,7 @@ package detail_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,6 +212,26 @@ func TestDetail_Y_YanksKey(t *testing.T) {
 	m = press(t, m, key('y'))
 	if clip.last != "ABC-1" {
 		t.Fatalf("clipboard=%q want ABC-1", clip.last)
+	}
+}
+
+func TestDetail_View_HasHeaderAndSections(t *testing.T) {
+	a := mkIssue("ABC-1", "alpha", 0)
+	s := seedStore(t, a)
+	_ = s.ReplaceComments(context.Background(), "ABC-1", []model.Comment{
+		{ID: "c1", IssueKey: "ABC-1", Author: alice, Body: "first comment", Created: t0},
+	})
+	m := loadInto(t, detail.New(s, []model.Issue{a}, 0))
+	m.SetSize(100, 40)
+	v := m.View()
+	if !strings.Contains(v, "ABC-1") {
+		t.Errorf("expected issue key in view; got:\n%s", v)
+	}
+	if !strings.Contains(v, "Description") {
+		t.Errorf("expected 'Description' section in view; got:\n%s", v)
+	}
+	if !strings.Contains(v, "Comments (1)") {
+		t.Errorf("expected 'Comments (1)' section in view; got:\n%s", v)
 	}
 }
 

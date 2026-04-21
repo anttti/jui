@@ -65,22 +65,30 @@ to `~/Library/Logs/jira-tui/`. Remove it with `jira agent uninstall`.
 
 **List view**
 
-| Key         | Action                          |
-|-------------|---------------------------------|
-| `j` / `k`   | cursor down / up                |
-| `gg` / `G`  | jump to top / bottom            |
-| `Ctrl-d/u`  | half-page down / up             |
-| `Ctrl-f/b`  | page down / up                  |
-| `Enter` / `l` | open selected issue           |
-| `o`         | open issue URL in browser       |
-| `yy`        | yank issue key to clipboard     |
-| `/`         | search (incremental)            |
-| `:`         | command; type an issue key to jump |
-| `t` / `s` / `a` | focus type / status / assignee chip |
-| `Esc`       | dismiss search / chip / command |
+| Key             | Action                                     |
+|-----------------|--------------------------------------------|
+| `j` / `k`       | cursor down / up                           |
+| `gg` / `G`      | jump to top / bottom                       |
+| `Ctrl-d/u`      | half-page down / up                        |
+| `Ctrl-f/b`      | page down / up                             |
+| `Enter` / `l`   | open selected issue                        |
+| `o` / `w`       | open issue URL in browser                  |
+| `yy`            | yank issue key to clipboard                |
+| `/`             | search (incremental)                       |
+| `:`             | command; type an issue key to jump         |
+| `t` / `s` / `a` | focus type / status / assignee chip        |
+| `z`             | open sort chip                             |
+| `c`             | open column-configuration chip             |
+| `p` + `1..9`    | save current columns to that preset slot   |
+| `1..9`          | recall the column preset in that slot      |
+| `q`             | quit                                       |
+| `Esc`           | dismiss search / chip / command            |
 
-In a chip: `j/k` to move, `Space` to toggle (type, status) or `Enter` to
-commit, `Esc` to cancel.
+In a filter chip: `j/k` to move, `Space` to toggle (type, status) or
+`Enter` to commit, `Esc` to cancel. In the sort chip, `Space` cycles the
+focused column through absent → ascending → descending. In the columns
+chip, `Space` toggles visibility and `J` / `K` moves the focused column
+down / up.
 
 **Detail view**
 
@@ -90,11 +98,12 @@ commit, `Esc` to cancel.
 | `gg` / `G`| top / bottom                  |
 | `Ctrl-d/u`| half-page scroll              |
 | `]` / `[` | next / previous issue         |
-| `o`       | open in browser               |
+| `o` / `w` | open in browser               |
 | `y`       | yank issue key                |
 | `h` / `q` / `Esc` | back to the list      |
 
-`Ctrl-C` quits from anywhere.
+`Ctrl-C` quits from anywhere. Filters, sort, column presets, and the
+last-viewed issue are persisted at `~/.config/jui/state.json`.
 
 ## Development
 

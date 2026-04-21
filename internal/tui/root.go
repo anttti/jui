@@ -4,12 +4,14 @@ package tui
 
 import (
 	"context"
+	"strconv"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/anttti/j/internal/model"
 	"github.com/anttti/j/internal/store"
 	"github.com/anttti/j/internal/sync"
+	"github.com/anttti/j/internal/tui/appstate"
 	"github.com/anttti/j/internal/tui/detail"
 	"github.com/anttti/j/internal/tui/list"
 )
@@ -34,18 +36,26 @@ type Deps struct {
 	Fetcher   sync.IssueFetcher
 	Clipboard Clipboard
 	Opener    Opener
+	// StatePath, when non-empty, enables load-on-init / save-on-change of
+	// persistent UI state (filters, sort, column presets, last view).
+	StatePath string
 }
 
 // Model is the root tea.Model.
 type Model struct {
-	reader  store.Reader
-	fetcher sync.IssueFetcher
-	clip    Clipboard
-	opener  Opener
+	reader    store.Reader
+	fetcher   sync.IssueFetcher
+	clip      Clipboard
+	opener    Opener
+	statePath string
 
-	list    list.Model
-	detail  detail.Model
-	view    View
+	list   list.Model
+	detail detail.Model
+	view   View
+
+	// pendingOpen, if non-empty, is the key to re-open on startup after the
+	// list's initial load completes.
+	pendingOpen string
 
 	err error
 }
@@ -56,13 +66,26 @@ func New(deps Deps) Model {
 	if deps.Clipboard != nil {
 		listOpts = append(listOpts, list.WithClipboard(clipAdapter{deps.Clipboard}))
 	}
+
+	// Pull previously persisted state, if any.
+	st, _ := appstate.Load(deps.StatePath)
+	cols := decodeColumns(st.Columns)
+	sortKeys := decodeSort(st.Sort)
+	presets := decodePresets(st.Presets)
+	filter := decodeFilter(st.Filter)
+
+	listOpts = append(listOpts,
+		list.WithInitialState(cols, sortKeys, presets, st.ActivePreset, filter),
+	)
 	return Model{
-		reader:  deps.Store,
-		fetcher: deps.Fetcher,
-		clip:    deps.Clipboard,
-		opener:  deps.Opener,
-		list:    list.New(deps.Store, listOpts...),
-		view:    ViewList,
+		reader:      deps.Store,
+		fetcher:     deps.Fetcher,
+		clip:        deps.Clipboard,
+		opener:      deps.Opener,
+		statePath:   deps.StatePath,
+		view:        ViewList,
+		pendingOpen: st.SelectedKey,
+		list:        list.New(deps.Store, listOpts...),
 	}
 }
 
@@ -79,19 +102,25 @@ func (m Model) Init() tea.Cmd { return m.list.Init() }
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	// Global keys first.
 	if km, ok := msg.(tea.KeyMsg); ok && km.Type == tea.KeyCtrlC {
+		m.save()
 		return m, tea.Quit
 	}
 
 	switch msg := msg.(type) {
 	case list.OpenIssueMsg:
-		return m.openIssue(msg.Key)
+		next, cmd := m.openIssue(msg.Key)
+		next.save()
+		return next, cmd
 
 	case fetchDoneMsg:
-		return m.onFetchDone(msg)
+		next, cmd := m.onFetchDone(msg)
+		next.save()
+		return next, cmd
 
 	case detail.BackMsg:
 		m.view = ViewList
 		m.detail = detail.Model{}
+		m.save()
 		return m, nil
 
 	case list.OpenURLMsg:
@@ -107,18 +136,34 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Route to the active view.
+	var cmd tea.Cmd
 	switch m.view {
 	case ViewList:
-		var cmd tea.Cmd
 		m.list, cmd = m.list.Update(msg)
-		return m, cmd
 	case ViewDetail:
-		var cmd tea.Cmd
 		m.detail, cmd = m.detail.Update(msg)
-		return m, cmd
 	}
-	return m, nil
+
+	// Re-open the last-viewed issue once the list has loaded. This is the
+	// one place we consume pendingOpen; clear it to avoid looping.
+	if m.pendingOpen != "" && m.view == ViewList {
+		if _, ok := msg.(tea.KeyMsg); !ok {
+			// Try to reopen only after data lands; `loadedMsg` is internal
+			// to the list package, so we just opportunistically try on any
+			// non-key message.
+			key := m.pendingOpen
+			m.pendingOpen = ""
+			if len(m.list.Issues()) > 0 || key != "" {
+				reopen, rcmd := m.openIssue(key)
+				reopen.save()
+				return reopen, tea.Batch(cmd, rcmd)
+			}
+		}
+	}
+	if _, ok := msg.(tea.KeyMsg); ok {
+		m.save()
+	}
+	return m, cmd
 }
 
 // View renders whichever screen is active.
@@ -224,3 +269,150 @@ func (m Model) DetailKey() string {
 
 // Err returns the last root-level error (fetch failure, etc.).
 func (m Model) Err() error { return m.err }
+
+// -----------------------------------------------------------------------------
+// Persistence
+// -----------------------------------------------------------------------------
+
+func (m Model) save() {
+	if m.statePath == "" {
+		return
+	}
+	_ = appstate.Save(m.statePath, m.snapshot())
+}
+
+func (m Model) snapshot() appstate.State {
+	var selected string
+	switch m.view {
+	case ViewDetail:
+		selected = m.detail.Current().Key
+	case ViewList:
+		if iss := m.list.Issues(); len(iss) > 0 {
+			c := m.list.Cursor()
+			if c >= 0 && c < len(iss) {
+				selected = iss[c].Key
+			}
+		}
+	}
+	view := "list"
+	if m.view == ViewDetail {
+		view = "detail"
+	}
+	return appstate.State{
+		View:         view,
+		SelectedKey:  selected,
+		Filter:       encodeFilter(m.list.Filter()),
+		Sort:         encodeSort(m.list.Sort()),
+		Columns:      encodeColumns(m.list.Columns()),
+		ActivePreset: m.list.ActivePreset(),
+		Presets:      encodePresets(m.list.Presets()),
+	}
+}
+
+func encodeFilter(f model.Filter) appstate.Filter {
+	out := appstate.Filter{
+		Types:    append([]string(nil), f.Types...),
+		Statuses: append([]string(nil), f.Statuses...),
+		Search:   f.Search,
+	}
+	switch f.Assignee.Kind {
+	case model.AssigneeKindMe:
+		out.Assignee = appstate.Assignee{Kind: "me"}
+	case model.AssigneeKindUnassigned:
+		out.Assignee = appstate.Assignee{Kind: "unassigned"}
+	case model.AssigneeKindAccount:
+		out.Assignee = appstate.Assignee{Kind: "account", AccountID: f.Assignee.AccountID}
+	default:
+		out.Assignee = appstate.Assignee{Kind: "all"}
+	}
+	return out
+}
+
+func decodeFilter(f appstate.Filter) model.Filter {
+	out := model.Filter{
+		Types:    append([]string(nil), f.Types...),
+		Statuses: append([]string(nil), f.Statuses...),
+		Search:   f.Search,
+	}
+	switch f.Assignee.Kind {
+	case "me":
+		out.Assignee = model.AssigneeMe()
+	case "unassigned":
+		out.Assignee = model.AssigneeUnassigned()
+	case "account":
+		out.Assignee = model.AssigneeAccount(f.Assignee.AccountID)
+	default:
+		out.Assignee = model.AssigneeAll()
+	}
+	return out
+}
+
+func encodeSort(keys []list.SortKey) []appstate.SortKey {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make([]appstate.SortKey, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, appstate.SortKey{Column: string(k.Column), Desc: k.Desc})
+	}
+	return out
+}
+
+func decodeSort(keys []appstate.SortKey) []list.SortKey {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make([]list.SortKey, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, list.SortKey{Column: list.ColumnID(k.Column), Desc: k.Desc})
+	}
+	return out
+}
+
+func encodeColumns(cols []list.ColumnID) []string {
+	if len(cols) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(cols))
+	for _, c := range cols {
+		out = append(out, string(c))
+	}
+	return out
+}
+
+func decodeColumns(cols []string) []list.ColumnID {
+	if len(cols) == 0 {
+		return nil
+	}
+	out := make([]list.ColumnID, 0, len(cols))
+	for _, c := range cols {
+		out = append(out, list.ColumnID(c))
+	}
+	return out
+}
+
+func encodePresets(p map[int][]list.ColumnID) map[string][]string {
+	if len(p) == 0 {
+		return nil
+	}
+	out := map[string][]string{}
+	for slot, cols := range p {
+		out[strconv.Itoa(slot)] = encodeColumns(cols)
+	}
+	return out
+}
+
+func decodePresets(p map[string][]string) map[int][]list.ColumnID {
+	if len(p) == 0 {
+		return nil
+	}
+	out := map[int][]list.ColumnID{}
+	for slot, cols := range p {
+		n, err := strconv.Atoi(slot)
+		if err != nil {
+			continue
+		}
+		out[n] = decodeColumns(cols)
+	}
+	return out
+}

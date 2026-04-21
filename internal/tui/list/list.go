@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/anttti/j/internal/model"
 	"github.com/anttti/j/internal/store"
+	"github.com/anttti/j/internal/tui/style"
 )
 
 // Mode is the vim-style mode this view is in.
@@ -31,6 +33,9 @@ const (
 	ChipType
 	ChipStatus
 	ChipAssignee
+	ChipSort
+	ChipColumns
+	ChipPresetSave
 )
 
 // Clipboard abstracts OS clipboard access for testability.
@@ -41,6 +46,22 @@ type Option func(*Model)
 
 // WithClipboard injects a clipboard.
 func WithClipboard(c Clipboard) Option { return func(m *Model) { m.clip = c } }
+
+// WithInitialState seeds the model with a previously persisted snapshot.
+// Unset fields in the snapshot use the model's defaults.
+func WithInitialState(cols []ColumnID, sort []SortKey, presets map[int][]ColumnID, activePreset int, filter model.Filter) Option {
+	return func(m *Model) {
+		if len(cols) > 0 {
+			m.cols = cols
+		}
+		m.sortKeys = sort
+		if presets != nil {
+			m.presets = presets
+		}
+		m.activePreset = activePreset
+		m.filter = filter
+	}
+}
 
 // -----------------------------------------------------------------------------
 // Messages
@@ -76,14 +97,26 @@ type Model struct {
 	chipFocus Chip
 
 	// per-chip UI state
-	typeValues      []string
-	typeIdx         int
-	typeSelected    map[string]bool
-	statusValues    []string
-	statusIdx       int
-	statusSelected  map[string]bool
-	assigneeValues  []model.User
-	assigneeIdx     int
+	typeValues     []string
+	typeIdx        int
+	typeSelected   map[string]bool
+	statusValues   []string
+	statusIdx      int
+	statusSelected map[string]bool
+	assigneeValues []model.User
+	assigneeIdx    int
+
+	// sort state + chip
+	sortKeys []SortKey
+	sortIdx  int
+
+	// column configuration + presets
+	cols         []ColumnID
+	colsIdx      int
+	colsVisible  map[ColumnID]bool // used while editing in ChipColumns
+	colsOrder    []ColumnID        // working order while editing in ChipColumns
+	presets      map[int][]ColumnID
+	activePreset int
 
 	issues []model.Issue
 	total  int
@@ -102,6 +135,8 @@ func New(r store.Reader, opts ...Option) Model {
 		reader:         r,
 		typeSelected:   map[string]bool{},
 		statusSelected: map[string]bool{},
+		cols:           append([]ColumnID(nil), DefaultColumns...),
+		presets:        map[int][]ColumnID{},
 	}
 	for _, o := range opts {
 		o(&m)
@@ -117,6 +152,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case loadedMsg:
 		m.issues = msg.issues
+		applySort(m.issues, m.sortKeys)
 		m.total = msg.total
 		m.err = msg.err
 		if m.cursor > len(m.issues)-1 {
@@ -228,11 +264,23 @@ func (m Model) handleNormal(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.focusChip(ChipStatus)
 	case 'a':
 		return m.focusChip(ChipAssignee)
-	case 'o':
+	case 'o', 'w':
 		if m.cursor < len(m.issues) {
 			url := m.issues[m.cursor].URL
 			return m, func() tea.Msg { return OpenURLMsg{URL: url} }
 		}
+	case 'q':
+		return m, tea.Quit
+	case 'z':
+		return m.focusChip(ChipSort)
+	case 'c':
+		return m.focusChip(ChipColumns)
+	case 'p':
+		m.chipFocus = ChipPresetSave
+		return m, nil
+	case '1', '2', '3', '4', '5', '6', '7', '8', '9':
+		slot := int(msg.Runes[0] - '0')
+		return m.recallPreset(slot)
 	}
 	return m, nil
 }
@@ -312,25 +360,61 @@ func (m Model) focusChip(c Chip) (Model, tea.Cmd) {
 		vs, _ := m.reader.DistinctTypes(ctx)
 		m.typeValues = vs
 		m.typeIdx = 0
-		if m.typeSelected == nil {
-			m.typeSelected = map[string]bool{}
+		m.typeSelected = map[string]bool{}
+		for _, t := range m.filter.Types {
+			m.typeSelected[t] = true
 		}
 	case ChipStatus:
 		vs, _ := m.reader.DistinctStatuses(ctx)
 		m.statusValues = vs
 		m.statusIdx = 0
-		if m.statusSelected == nil {
-			m.statusSelected = map[string]bool{}
+		m.statusSelected = map[string]bool{}
+		for _, s := range m.filter.Statuses {
+			m.statusSelected[s] = true
 		}
 	case ChipAssignee:
 		us, _ := m.reader.Assignees(ctx)
-		m.assigneeValues = us
+		// Prepend a virtual "All" row at index 0 so the user can clear
+		// the filter from within the dropdown. Empty AccountID is the
+		// sentinel.
+		m.assigneeValues = append([]model.User{{DisplayName: "All"}}, us...)
 		m.assigneeIdx = 0
+	case ChipSort:
+		m.sortIdx = 0
+	case ChipColumns:
+		// Prime a working copy so Esc can cancel without mutating the
+		// live order.
+		m.colsOrder = append([]ColumnID(nil), m.cols...)
+		// Hidden columns live past the visible ones in the working order.
+		for _, id := range AllColumns {
+			if !containsCol(m.colsOrder, id) {
+				m.colsOrder = append(m.colsOrder, id)
+			}
+		}
+		m.colsVisible = map[ColumnID]bool{}
+		for _, id := range m.cols {
+			m.colsVisible[id] = true
+		}
+		m.colsIdx = 0
 	}
 	return m, nil
 }
 
 func (m Model) handleChip(msg tea.KeyMsg) (Model, tea.Cmd) {
+	// The preset-save popup is modal: only a digit or Esc is meaningful.
+	if m.chipFocus == ChipPresetSave {
+		if msg.Type == tea.KeyEsc {
+			m.chipFocus = ChipNone
+			return m, nil
+		}
+		if len(msg.Runes) == 1 && msg.Runes[0] >= '1' && msg.Runes[0] <= '9' {
+			slot := int(msg.Runes[0] - '0')
+			m.presets[slot] = append([]ColumnID(nil), m.cols...)
+			m.activePreset = slot
+			m.chipFocus = ChipNone
+			}
+		return m, nil
+	}
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.chipFocus = ChipNone
@@ -346,9 +430,27 @@ func (m Model) handleChip(msg tea.KeyMsg) (Model, tea.Cmd) {
 			sort.Strings(m.filter.Statuses)
 		case ChipAssignee:
 			if m.assigneeIdx >= 0 && m.assigneeIdx < len(m.assigneeValues) {
-				m.filter.Assignee = model.AssigneeAccount(m.assigneeValues[m.assigneeIdx].AccountID)
+				u := m.assigneeValues[m.assigneeIdx]
+				if u.AccountID == "" {
+					m.filter.Assignee = model.AssigneeAll()
+				} else {
+					m.filter.Assignee = model.AssigneeAccount(u.AccountID)
+				}
 			} else {
 				m.filter.Assignee = model.AssigneeAll()
+			}
+		case ChipSort:
+			// Sort has no commit step — changes are applied as you toggle.
+		case ChipColumns:
+			var next []ColumnID
+			for _, id := range m.colsOrder {
+				if m.colsVisible[id] {
+					next = append(next, id)
+				}
+			}
+			if len(next) > 0 {
+				m.cols = next
+				m.activePreset = 0
 			}
 		}
 		m.chipFocus = ChipNone
@@ -365,6 +467,17 @@ func (m Model) handleChip(msg tea.KeyMsg) (Model, tea.Cmd) {
 				v := m.statusValues[m.statusIdx]
 				m.statusSelected[v] = !m.statusSelected[v]
 			}
+		case ChipSort:
+			if m.sortIdx < len(SortableColumns) {
+				col := SortableColumns[m.sortIdx]
+				m.sortKeys = toggleSortKey(m.sortKeys, col)
+				applySort(m.issues, m.sortKeys)
+					}
+		case ChipColumns:
+			if m.colsIdx < len(m.colsOrder) {
+				id := m.colsOrder[m.colsIdx]
+				m.colsVisible[id] = !m.colsVisible[id]
+			}
 		}
 		return m, nil
 	}
@@ -378,6 +491,10 @@ func (m Model) handleChip(msg tea.KeyMsg) (Model, tea.Cmd) {
 				m.statusIdx = clamp(m.statusIdx+1, 0, len(m.statusValues)-1)
 			case ChipAssignee:
 				m.assigneeIdx = clamp(m.assigneeIdx+1, 0, len(m.assigneeValues)-1)
+			case ChipSort:
+				m.sortIdx = clamp(m.sortIdx+1, 0, len(SortableColumns)-1)
+			case ChipColumns:
+				m.colsIdx = clamp(m.colsIdx+1, 0, len(m.colsOrder)-1)
 			}
 		case 'k':
 			switch m.chipFocus {
@@ -387,6 +504,22 @@ func (m Model) handleChip(msg tea.KeyMsg) (Model, tea.Cmd) {
 				m.statusIdx = clamp(m.statusIdx-1, 0, len(m.statusValues)-1)
 			case ChipAssignee:
 				m.assigneeIdx = clamp(m.assigneeIdx-1, 0, len(m.assigneeValues)-1)
+			case ChipSort:
+				m.sortIdx = clamp(m.sortIdx-1, 0, len(SortableColumns)-1)
+			case ChipColumns:
+				m.colsIdx = clamp(m.colsIdx-1, 0, len(m.colsOrder)-1)
+			}
+		case 'J':
+			// Move the focused column down (only in ChipColumns).
+			if m.chipFocus == ChipColumns && m.colsIdx+1 < len(m.colsOrder) {
+				m.colsOrder[m.colsIdx], m.colsOrder[m.colsIdx+1] = m.colsOrder[m.colsIdx+1], m.colsOrder[m.colsIdx]
+				m.colsIdx++
+			}
+		case 'K':
+			// Move the focused column up (only in ChipColumns).
+			if m.chipFocus == ChipColumns && m.colsIdx-1 >= 0 {
+				m.colsOrder[m.colsIdx], m.colsOrder[m.colsIdx-1] = m.colsOrder[m.colsIdx-1], m.colsOrder[m.colsIdx]
+				m.colsIdx--
 			}
 		}
 	}
@@ -407,6 +540,27 @@ func (m Model) yankCurrent() (Model, tea.Cmd) {
 	return m, nil
 }
 
+// recallPreset switches the active column set to the preset in the given
+// slot. Slots with no preset are silently ignored.
+func (m Model) recallPreset(slot int) (Model, tea.Cmd) {
+	cols, ok := m.presets[slot]
+	if !ok || len(cols) == 0 {
+		return m, nil
+	}
+	m.cols = append([]ColumnID(nil), cols...)
+	m.activePreset = slot
+	return m, nil
+}
+
+func containsCol(list []ColumnID, id ColumnID) bool {
+	for _, c := range list {
+		if c == id {
+			return true
+		}
+	}
+	return false
+}
+
 // -----------------------------------------------------------------------------
 // Data loading
 // -----------------------------------------------------------------------------
@@ -424,39 +578,72 @@ func (m Model) reload() tea.Cmd {
 // View
 // -----------------------------------------------------------------------------
 
-// View renders the list. Simple for now; teatest golden coverage comes later.
+// View renders the list as a toolbar, optional filter dropdown, table of
+// issues, and status-bar footer.
 func (m Model) View() string {
-	var b strings.Builder
-
-	// Toolbar.
-	b.WriteString(renderChip("t", "type", summariseSelected(m.typeSelected), m.chipFocus == ChipType))
-	b.WriteString("  ")
-	b.WriteString(renderChip("s", "status", summariseSelected(m.statusSelected), m.chipFocus == ChipStatus))
-	b.WriteString("  ")
-	b.WriteString(renderChip("a", "assignee", assigneeLabel(m.filter.Assignee), m.chipFocus == ChipAssignee))
-	b.WriteString("   ")
-	if m.mode == ModeInsert {
-		b.WriteString("/" + m.searchBuf + "█")
-	} else if m.filter.Search != "" {
-		b.WriteString("/" + m.filter.Search)
+	w := m.width
+	if w <= 0 {
+		w = 120
 	}
-	b.WriteString("\n\n")
+
+	var b strings.Builder
+	b.WriteString(m.renderToolbar(w))
+	b.WriteString("\n")
+
+	if m.chipFocus != ChipNone {
+		dd := strings.TrimRight(m.renderDropdown(), "\n")
+		b.WriteString(style.Panel.Render(dd))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 
 	if m.err != nil {
-		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render("error: "+m.err.Error()) + "\n")
+		b.WriteString(style.Error.Render("error: "+m.err.Error()) + "\n")
 	}
 
+	b.WriteString(renderHeaderLine(m.cols, w, m.sortKeys))
+	b.WriteString("\n")
+
+	widths := computeColumnWidths(m.cols, w)
 	for i, iss := range m.issues {
-		row := fmt.Sprintf("  %-10s  %-12s  %-8s  %s", iss.Key, iss.Status, iss.Type, iss.Summary)
-		if i == m.cursor {
-			b.WriteString(lipgloss.NewStyle().Bold(true).Reverse(true).Render(row))
-		} else {
-			b.WriteString(row)
-		}
+		b.WriteString(renderIssueRow(m.cols, widths, iss, w, i == m.cursor))
 		b.WriteString("\n")
 	}
 
-	// Status bar.
+	b.WriteString("\n")
+	b.WriteString(m.renderStatusBar(w))
+	return b.String()
+}
+
+func (m Model) renderToolbar(w int) string {
+	tabs := []string{
+		renderChip("t", "type", summariseSelected(m.typeSelected), m.chipFocus == ChipType),
+		renderChip("s", "status", summariseSelected(m.statusSelected), m.chipFocus == ChipStatus),
+		renderChip("a", "assignee", assigneeLabel(m.filter.Assignee), m.chipFocus == ChipAssignee),
+		renderChip("z", "sort", summariseSort(m.sortKeys), m.chipFocus == ChipSort),
+		renderChip("c", "cols", summariseCols(m.cols, m.activePreset), m.chipFocus == ChipColumns),
+	}
+	tabsStr := strings.Join(tabs, style.TabSeparator)
+
+	var right string
+	if m.mode == ModeInsert {
+		right = style.MutedText.Render("/") + m.searchBuf + "█"
+	} else if m.filter.Search != "" {
+		right = style.MutedText.Render("/" + m.filter.Search)
+	}
+	if right == "" {
+		return tabsStr
+	}
+	tw := lipgloss.Width(tabsStr)
+	rw := lipgloss.Width(right)
+	if tw+rw+1 >= w {
+		return tabsStr + " " + right
+	}
+	return tabsStr + strings.Repeat(" ", w-tw-rw) + right
+}
+
+
+func (m Model) renderStatusBar(w int) string {
 	mode := "NORMAL"
 	switch m.mode {
 	case ModeInsert:
@@ -464,26 +651,131 @@ func (m Model) View() string {
 	case ModeCommand:
 		mode = "COMMAND"
 	}
-	b.WriteString(fmt.Sprintf("\n%d/%d • %s", len(m.issues), m.total, mode))
-	if m.mode == ModeCommand {
-		b.WriteString("  :" + m.cmdBuf + "█")
+	left := style.ModePill(mode)
+	count := fmt.Sprintf("  %d/%d", len(m.issues), m.total)
+
+	var hint string
+	switch {
+	case m.mode == ModeCommand:
+		hint = ":" + m.cmdBuf + "█"
+	case m.chipFocus == ChipAssignee:
+		hint = "j/k move · enter select · esc cancel"
+	case m.chipFocus != ChipNone:
+		hint = "j/k move · space toggle · enter apply · esc cancel"
+	default:
+		hint = "j/k move · / search · : cmd · enter open"
+	}
+	right := style.MutedText.Render(hint) + "  "
+
+	lw := lipgloss.Width(left)
+	cw := lipgloss.Width(count)
+	rw := lipgloss.Width(right)
+	pad := w - lw - cw - rw
+	if pad < 1 {
+		pad = 1
+	}
+	inside := left + count + strings.Repeat(" ", pad) + right
+	return style.StatusBar.Copy().Width(w).MaxWidth(w).Render(inside)
+}
+
+func (m Model) renderDropdown() string {
+	var b strings.Builder
+	switch m.chipFocus {
+	case ChipType:
+		for i, v := range m.typeValues {
+			b.WriteString(renderDropdownRow(i == m.typeIdx, true, m.typeSelected[v], v))
+		}
+	case ChipStatus:
+		for i, v := range m.statusValues {
+			b.WriteString(renderDropdownRow(i == m.statusIdx, true, m.statusSelected[v], v))
+		}
+	case ChipAssignee:
+		for i, u := range m.assigneeValues {
+			label := u.DisplayName
+			if label == "" {
+				label = u.AccountID
+			}
+			b.WriteString(renderDropdownRow(i == m.assigneeIdx, false, false, label))
+		}
+	case ChipSort:
+		sortDir := map[ColumnID]string{}
+		sortPos := map[ColumnID]int{}
+		for i, k := range m.sortKeys {
+			if k.Desc {
+				sortDir[k.Column] = "↓"
+			} else {
+				sortDir[k.Column] = "↑"
+			}
+			sortPos[k.Column] = i + 1
+		}
+		for i, id := range SortableColumns {
+			label := columnLabel(id)
+			if dir, ok := sortDir[id]; ok {
+				label = fmt.Sprintf("%s %s (%d)", label, dir, sortPos[id])
+			}
+			b.WriteString(renderDropdownRow(i == m.sortIdx, false, false, label))
+		}
+	case ChipColumns:
+		for i, id := range m.colsOrder {
+			label := columnLabel(id) + " — " + string(id)
+			b.WriteString(renderDropdownRow(i == m.colsIdx, true, m.colsVisible[id], label))
+		}
+	case ChipPresetSave:
+		b.WriteString(style.MutedText.Render("press 1-9 to save current columns to that preset slot:") + "\n")
+		for i := 1; i <= 9; i++ {
+			marker := "  "
+			note := "(empty)"
+			if cols, ok := m.presets[i]; ok && len(cols) > 0 {
+				marker = "• "
+				note = fmt.Sprintf("(%d cols)", len(cols))
+			}
+			b.WriteString(fmt.Sprintf("%s%d %s\n", marker, i, note))
+		}
 	}
 	return b.String()
+}
+
+func renderDropdownRow(cursor, checkbox, checked bool, label string) string {
+	var prefix string
+	if cursor {
+		prefix = "▸ "
+	} else {
+		prefix = "  "
+	}
+	var check string
+	if checkbox {
+		if checked {
+			check = "[x] "
+		} else {
+			check = "[ ] "
+		}
+	} else {
+		check = "• "
+	}
+	line := prefix + check + label
+	if cursor {
+		line = lipgloss.NewStyle().Foreground(style.Primary).Bold(true).Render(line)
+	}
+	return line + "\n"
 }
 
 // -----------------------------------------------------------------------------
 // Test introspection helpers
 // -----------------------------------------------------------------------------
 
-func (m Model) Mode() Mode               { return m.mode }
-func (m Model) Cursor() int              { return m.cursor }
-func (m Model) Issues() []model.Issue    { return m.issues }
-func (m Model) SearchBuffer() string     { return m.searchBuf }
-func (m Model) CommandBuffer() string    { return m.cmdBuf }
-func (m Model) Filter() model.Filter     { return m.filter }
-func (m Model) Pending() string          { return m.pending }
-func (m Model) ChipFocus() Chip          { return m.chipFocus }
-func (m Model) Total() int               { return m.total }
+func (m Model) Mode() Mode                    { return m.mode }
+func (m Model) Cursor() int                   { return m.cursor }
+func (m Model) Issues() []model.Issue         { return m.issues }
+func (m Model) SearchBuffer() string          { return m.searchBuf }
+func (m Model) CommandBuffer() string         { return m.cmdBuf }
+func (m Model) Filter() model.Filter          { return m.filter }
+func (m Model) Pending() string               { return m.pending }
+func (m Model) ChipFocus() Chip               { return m.chipFocus }
+func (m Model) Total() int                    { return m.total }
+func (m Model) Sort() []SortKey               { return m.sortKeys }
+func (m Model) Columns() []ColumnID           { return m.cols }
+func (m Model) Presets() map[int][]ColumnID   { return m.presets }
+func (m Model) ActivePreset() int             { return m.activePreset }
 
 // -----------------------------------------------------------------------------
 // helpers
@@ -511,6 +803,28 @@ func summariseSelected(m map[string]bool) string {
 	return strings.Join(vs, ", ")
 }
 
+func summariseSort(keys []SortKey) string {
+	if len(keys) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		arrow := "↑"
+		if k.Desc {
+			arrow = "↓"
+		}
+		parts = append(parts, columnLabel(k.Column)+arrow)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func summariseCols(cols []ColumnID, activePreset int) string {
+	if activePreset > 0 {
+		return fmt.Sprintf("preset %d (%d)", activePreset, len(cols))
+	}
+	return fmt.Sprintf("%d", len(cols))
+}
+
 func assigneeLabel(a model.AssigneeFilter) string {
 	switch a.Kind {
 	case model.AssigneeKindMe:
@@ -527,15 +841,38 @@ func assigneeLabel(a model.AssigneeFilter) string {
 	}
 }
 
-var chipStyle = lipgloss.NewStyle().Padding(0, 1)
-var chipFocusedStyle = chipStyle.Copy().Bold(true).Reverse(true)
-
 func renderChip(hotkey, label, value string, focused bool) string {
-	text := fmt.Sprintf("[%s]%s: %s", hotkey, label, value)
+	text := fmt.Sprintf("[%s] %s: %s", hotkey, label, value)
 	if focused {
-		return chipFocusedStyle.Render(text)
+		return style.TabFocused.Render(text)
 	}
-	return chipStyle.Render(text)
+	return style.Tab.Render(text)
+}
+
+// relTime returns a compact human-readable age like "5m", "2h", "3d", "1w",
+// "2y". Zero times render as "—".
+func relTime(t time.Time) string {
+	if t.IsZero() {
+		return "—"
+	}
+	d := time.Since(t)
+	if d < 0 {
+		d = -d
+	}
+	switch {
+	case d < time.Minute:
+		return "now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d/time.Minute))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%dd", int(d/(24*time.Hour)))
+	case d < 365*24*time.Hour:
+		return fmt.Sprintf("%dw", int(d/(7*24*time.Hour)))
+	default:
+		return fmt.Sprintf("%dy", int(d/(365*24*time.Hour)))
+	}
 }
 
 func clamp(v, lo, hi int) int {

@@ -7,9 +7,11 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/anttti/j/internal/model"
 	"github.com/anttti/j/internal/store"
+	"github.com/anttti/j/internal/tui/style"
 )
 
 // Clipboard is the OS clipboard abstraction.
@@ -142,7 +144,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.comments = nil
 			return m, m.loadCommentsCmd(m.Current().Key)
 		}
-	case 'o':
+	case 'o', 'w':
 		url := m.Current().URL
 		return m, func() tea.Msg { return OpenURLMsg{URL: url} }
 	case 'y':
@@ -162,42 +164,95 @@ func (m Model) loadCommentsCmd(key string) tea.Cmd {
 	}
 }
 
-// View renders the detail view. Simple for now; golden rendering comes later.
+// View renders the detail view with a styled header panel, sectioned body,
+// and scroll slicing. The pre-slice string is produced by renderContent so
+// contentLines can count the exact same newlines.
 func (m Model) View() string {
+	content := m.renderContent()
+	lines := strings.Split(content, "\n")
+	start := clamp(m.scroll, 0, len(lines))
+	end := clamp(start+pageSize(m.height), 0, len(lines))
+	return strings.Join(lines[start:end], "\n")
+}
+
+func (m Model) renderContent() string {
 	iss := m.Current()
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s — %s\n", iss.Key, iss.Summary)
-	fmt.Fprintf(&b, "Status: %s   Type: %s   Priority: %s\n", iss.Status, iss.Type, iss.Priority)
-	if iss.Assignee != nil {
-		fmt.Fprintf(&b, "Assignee: %s   ", iss.Assignee.DisplayName)
-	}
-	if iss.Reporter != nil {
-		fmt.Fprintf(&b, "Reporter: %s", iss.Reporter.DisplayName)
-	}
+	b.WriteString(renderHeaderPanel(iss))
+	b.WriteString("\n\n")
+
+	b.WriteString(style.Subtitle.Render("Description"))
 	b.WriteString("\n")
-	if iss.DueDate != nil {
-		fmt.Fprintf(&b, "Due: %s\n", iss.DueDate.Format("2006-01-02"))
-	}
-	b.WriteString("\n# Description\n\n")
+	b.WriteString(style.HorizontalRule(w - 2))
+	b.WriteString("\n")
 	b.WriteString(iss.Description)
 	b.WriteString("\n\n")
 
 	if len(m.comments) > 0 {
-		fmt.Fprintf(&b, "# Comments (%d)\n\n", len(m.comments))
-		for _, c := range m.comments {
+		b.WriteString(style.Subtitle.Render(fmt.Sprintf("Comments (%d)", len(m.comments))))
+		b.WriteString("\n")
+		b.WriteString(style.HorizontalRule(w - 2))
+		b.WriteString("\n\n")
+		for i, c := range m.comments {
+			if i > 0 {
+				b.WriteString(style.HorizontalRule(w - 2))
+				b.WriteString("\n")
+			}
 			name := ""
 			if c.Author != nil {
 				name = c.Author.DisplayName
 			}
-			fmt.Fprintf(&b, "@%s · %s\n%s\n---\n", name, c.Created.Format("2006-01-02 15:04"), c.Body)
+			author := lipgloss.NewStyle().Bold(true).Render("@" + name)
+			stamp := style.MutedText.Render(" · " + c.Created.Format("2006-01-02 15:04"))
+			b.WriteString(author + stamp + "\n")
+			for _, line := range strings.Split(c.Body, "\n") {
+				b.WriteString("  " + line + "\n")
+			}
+			b.WriteString("\n")
 		}
 	}
 
-	// Return sliced by scroll.
-	lines := strings.Split(b.String(), "\n")
-	start := clamp(m.scroll, 0, len(lines))
-	end := clamp(start+pageSize(m.height), 0, len(lines))
-	return strings.Join(lines[start:end], "\n")
+	return b.String()
+}
+
+func renderHeaderPanel(iss model.Issue) string {
+	title := style.Title.Render(iss.Key) + "  " + lipgloss.NewStyle().Bold(true).Render(iss.Summary)
+
+	metaCells := []string{
+		style.TypeStyle(iss.Type).Render(iss.Type),
+		style.StatusStyle(iss.StatusCategory).Render(iss.Status),
+	}
+	if iss.Priority != "" {
+		metaCells = append(metaCells, style.PriorityStyle(iss.Priority).Render(iss.Priority))
+	}
+	asg := "—"
+	if iss.Assignee != nil && iss.Assignee.DisplayName != "" {
+		asg = iss.Assignee.DisplayName
+	}
+	metaCells = append(metaCells, style.MutedText.Render("assignee: "+asg))
+	if iss.Reporter != nil && iss.Reporter.DisplayName != "" {
+		metaCells = append(metaCells, style.MutedText.Render("reporter: "+iss.Reporter.DisplayName))
+	}
+	if iss.DueDate != nil {
+		metaCells = append(metaCells, style.MutedText.Render("due: "+iss.DueDate.Format("2006-01-02")))
+	}
+	if !iss.Created.IsZero() {
+		metaCells = append(metaCells, style.MutedText.Render("created: "+iss.Created.Format("2006-01-02")))
+	}
+	if !iss.Updated.IsZero() {
+		metaCells = append(metaCells, style.MutedText.Render("updated: "+iss.Updated.Format("2006-01-02 15:04")))
+	}
+	meta := strings.Join(metaCells, "  ")
+	out := title + "\n" + meta
+	if len(iss.Labels) > 0 {
+		out += "\n" + style.MutedText.Render("labels: ") + strings.Join(iss.Labels, " ")
+	}
+	return style.Panel.Render(out)
 }
 
 // -----------------------------------------------------------------------------
@@ -235,25 +290,8 @@ func (m Model) Pending() string { return m.pending }
 func (m *Model) SetSize(w, h int) { m.width, m.height = w, h }
 
 func (m Model) contentLines() int {
-	// Count lines in the fully-rendered content (pre-slice). Mirror View.
-	iss := m.Current()
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s — %s\n", iss.Key, iss.Summary)
-	fmt.Fprintf(&b, "Status: %s   Type: %s   Priority: %s\n", iss.Status, iss.Type, iss.Priority)
-	b.WriteString("\n")
-	if iss.DueDate != nil {
-		b.WriteString("due\n")
-	}
-	b.WriteString("\n# Description\n\n")
-	b.WriteString(iss.Description)
-	b.WriteString("\n\n")
-	if len(m.comments) > 0 {
-		b.WriteString("# Comments\n\n")
-		for range m.comments {
-			b.WriteString("\n\n---\n")
-		}
-	}
-	return strings.Count(b.String(), "\n")
+	// Must count the exact same newlines View renders pre-slice.
+	return strings.Count(m.renderContent(), "\n")
 }
 
 // -----------------------------------------------------------------------------

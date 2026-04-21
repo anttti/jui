@@ -92,6 +92,7 @@ func TUI(ctx context.Context, cfg *config.Config) error {
 		Fetcher:   engine,
 		Opener:    platform.Opener{},
 		Clipboard: platform.Clipboard{},
+		StatePath: filepath.Join(cfg.ConfigDir, "state.json"),
 	})
 	p := tea.NewProgram(teaAdapter{root}, tea.WithAltScreen(), tea.WithContext(ctx))
 	_, err = p.Run()
