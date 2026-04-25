@@ -3,6 +3,7 @@ package tui_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,6 +128,53 @@ func TestRoot_OpenExistingIssue_PushesDetail(t *testing.T) {
 	}
 	if got := m.DetailKey(); got != "ABC-1" {
 		t.Fatalf("detail key=%q want ABC-1", got)
+	}
+}
+
+// TestRoot_OpenIssue_DisplaysPersistedComments verifies that when the user
+// opens an issue, the comments persisted for it are loaded and rendered in
+// the detail view. Window size is delivered while the list is focused (the
+// realistic startup order); the detail view must inherit that size so the
+// comments don't fall off the bottom of the visible page.
+func TestRoot_OpenIssue_DisplaysPersistedComments(t *testing.T) {
+	// A realistic issue with a multi-line description so that, without size
+	// propagation, comments would render below the default 20-line page.
+	a := model.Issue{
+		IssueRef:    model.IssueRef{Key: "ABC-1", ID: "ABC-1-id", ProjectKey: "ABC"},
+		Summary:     "alpha",
+		Description: "This is the description.\n\n## Section\n\nMore text here.\n\nLine 1\nLine 2\nLine 3\nLine 4\nLine 5\nLine 6",
+		Type:        "Bug",
+		Status:      "To Do",
+		Assignee:    alice,
+		Created:     t0,
+		Updated:     t0,
+		URL:         "https://x.atlassian.net/browse/ABC-1",
+	}
+	s := seedStore(t, a)
+	if err := s.ReplaceComments(context.Background(), "ABC-1", []model.Comment{
+		{ID: "c1", IssueKey: "ABC-1", Author: alice, Body: "hello from alice", Created: t0},
+	}); err != nil {
+		t.Fatalf("seed comments: %v", err)
+	}
+
+	m := loadInto(t, newApp(t, s, &fakeFetcher{}, &fakeOpener{}))
+	// Window size delivered at startup, while list is still focused. This
+	// matches Bubble Tea's real boot behavior.
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 50})
+
+	m, cmd := m.Update(list.OpenIssueMsg{Key: "ABC-1"})
+	m = drain(m, cmd)
+
+	if m.CurrentView() != tui.ViewDetail {
+		t.Fatalf("view=%v want Detail", m.CurrentView())
+	}
+
+	v := m.View()
+	if !strings.Contains(v, "Comments (1)") {
+		t.Errorf("expected 'Comments (1)' in detail view; got:\n%s", v)
+	}
+	if !strings.Contains(v, "hello from alice") {
+		t.Errorf("expected comment body in detail view; got:\n%s", v)
 	}
 }
 
