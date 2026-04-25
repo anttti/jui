@@ -53,6 +53,11 @@ type Model struct {
 	detail detail.Model
 	view   View
 
+	// width/height track the most recent terminal size so views opened
+	// after startup (e.g. detail when the user drills into an issue) can
+	// inherit it and render with the correct page size.
+	width, height int
+
 	// pendingOpen, if non-empty, is the key to re-open on startup after the
 	// list's initial load completes.
 	pendingOpen string
@@ -104,6 +109,13 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	if km, ok := msg.(tea.KeyMsg); ok && km.Type == tea.KeyCtrlC {
 		m.save()
 		return m, tea.Quit
+	}
+
+	// Remember the latest terminal size so views created later (e.g. the
+	// detail view) inherit it. The message still falls through to the
+	// active view via the routing switch below.
+	if ws, ok := msg.(tea.WindowSizeMsg); ok {
+		m.width, m.height = ws.Width, ws.Height
 	}
 
 	switch msg := msg.(type) {
@@ -242,6 +254,9 @@ func (m Model) pushDetail(iss model.Issue) (Model, tea.Cmd) {
 		detailOpts = append(detailOpts, detail.WithClipboard(detailClipAdapter{m.clip}))
 	}
 	m.detail = detail.New(m.reader, siblings, idx, detailOpts...)
+	if m.width > 0 || m.height > 0 {
+		m.detail.SetSize(m.width, m.height)
+	}
 	m.view = ViewDetail
 	return m, m.detail.Init()
 }
