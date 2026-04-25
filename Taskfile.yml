@@ -3,6 +3,8 @@ version: '3'
 vars:
   BINARY: jira
   PKG: ./...
+  COVERAGE: coverage.out
+  COVERAGE_HTML: coverage.html
 
 tasks:
   default:
@@ -32,6 +34,18 @@ tasks:
     cmds:
       - go test {{.PKG}}
 
+  cover:
+    desc: Run tests with coverage and print a per-function summary
+    cmds:
+      - go test -coverprofile={{.COVERAGE}} -covermode=atomic {{.PKG}}
+      - go tool cover -func={{.COVERAGE}}
+
+  cover:html:
+    desc: Generate an HTML coverage report at coverage.html
+    deps: [cover]
+    cmds:
+      - go tool cover -html={{.COVERAGE}} -o {{.COVERAGE_HTML}}
+
   vet:
     desc: Run go vet
     cmds:
@@ -46,4 +60,5 @@ tasks:
     desc: Remove build artifacts
     cmds:
       - rm -f {{.BINARY}}
+      - rm -f {{.COVERAGE}} {{.COVERAGE_HTML}}
       - rm -rf dist
