@@ -109,6 +109,8 @@ last-viewed issue are persisted at `~/.config/jui/state.json`.
 
 ```sh
 task test       # go test ./...
+task cover      # tests + per-function coverage summary
+task cover:html # writes coverage.html
 task vet        # go vet ./...
 task run -- doctor
 ```
